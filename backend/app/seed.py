@@ -14,12 +14,13 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
 from .db import SessionLocal
-from .models import (ConfigVersion, Consist, Device, Line, MeterReading, Run,
-                     RunConsist, RunEvent, Section, Train, User, create_all,
+from .models import (ConfigVersion, Consist, Device, Line, MeterInput, MeterReading,
+                     Run, RunConsist, RunEvent, Section, Train, User, create_all,
                      drop_all)
 from .services.evaluate import evaluate_run, rebuild_grid
 from .services.metrics import publish_run_metrics, reprocess_run
 from .services.reconcile import reconcile_grid_aligned, reconcile_run_aligned
+from .services.uncertainty import assess
 
 D1 = datetime(2026, 10, 20, 8, 0)   # 场景1/2
 D4 = datetime(2026, 10, 21, 14, 0)  # 场景4
@@ -106,6 +107,135 @@ def process(db, run, note=None):
     reconcile_run_aligned(db, run)
     reconcile_grid_aligned(db, run)
     publish_run_metrics(db, run, note=note)
+
+
+# ---------------- 计量输入(证书/校准/分辨率/时钟/覆盖) ----------------
+
+def mi(db, device, quantity, *, input_key=None, version=1, supersedes=None,
+       multiplier_cert=None, cert_accuracy=0.004, cert_ref=None,
+       calibrated_at=None, calib_valid_to=None, resolution=0.1,
+       clock_tolerance_s=0.0, coverage_ratio=1.0, shared_key=None,
+       valid_from=None, note=None):
+    """登记一版计量输入。倍率证书晚到 = 同一 input_key 的新版本(旧版保留)。"""
+    key = input_key or f"{device.serial}:{quantity}"
+    rec = MeterInput(
+        input_key=key, version=version, supersedes_id=supersedes,
+        device_id=device.id, quantity=quantity,
+        multiplier_cert=multiplier_cert, cert_accuracy=cert_accuracy,
+        cert_ref=cert_ref, calibrated_at=calibrated_at,
+        calib_valid_to=calib_valid_to, resolution=resolution,
+        clock_tolerance_s=clock_tolerance_s, coverage_ratio=coverage_ratio,
+        shared_key=shared_key or key, valid_from=valid_from or datetime(2026, 1, 1),
+        note=note)
+    db.add(rec)
+    db.flush()
+    return rec
+
+
+def seed_meter_inputs(db):
+    """为验收场景登记计量输入证据。
+
+    覆盖:共享变电所表(SUB-S1 支撑 RUN-1001/1004 两列车)、倍率修订
+    (OB-T01:cert 晚到 v2)、时钟容差(OB-T02/SUB-S2)、过期校准(SUB-S2)、
+    缺校准证书(SUB-S3)、输入覆盖不足(SUB-S1 import 在 RUN-1006 窗口外)。
+    """
+    dev = {d.serial: d for d in db.query(Device).all()}
+    val = datetime(2027, 6, 30)        # 校准有效期(RUN 窗口内有效)
+    expired = datetime(2026, 6, 30)    # 已过期(但读数不为零,证书仍可用,按放大处理)
+
+    # 车载表:正常证书
+    for s in ("OB-T01",):
+        for q in ("traction", "regen", "aux"):
+            mi(db, dev[s], q, cert_accuracy=0.004, cert_ref=f"CERT-{s}",
+               calibrated_at=datetime(2026, 1, 10), calib_valid_to=val,
+               resolution=0.1, clock_tolerance_s=0.0, coverage_ratio=1.0,
+               shared_key=f"{s}:{q}")
+    # OB-T02:时钟容差较大(采样时钟错位样例)
+    for q in ("traction", "regen", "aux"):
+        mi(db, dev["OB-T02"], q, cert_accuracy=0.005, cert_ref="CERT-OB-T02",
+           calibrated_at=datetime(2026, 1, 10), calib_valid_to=val,
+           resolution=0.1, clock_tolerance_s=90.0, coverage_ratio=1.0,
+           shared_key=f"OB-T02:{q}")
+    # OB-T03 辅助负荷表:输入覆盖比例不足(间歇失联)
+    for q in ("traction", "regen"):
+        mi(db, dev["OB-T03"], q, cert_accuracy=0.004, cert_ref="CERT-OB-T03",
+           calibrated_at=datetime(2026, 1, 10), calib_valid_to=val,
+           resolution=0.1, clock_tolerance_s=0.0, coverage_ratio=1.0,
+           shared_key=f"OB-T03:{q}")
+    mi(db, dev["OB-T03"], "aux", cert_accuracy=0.004, cert_ref="CERT-OB-T03",
+       calibrated_at=datetime(2026, 1, 10), calib_valid_to=val,
+       resolution=0.1, clock_tolerance_s=0.0, coverage_ratio=0.90,
+       shared_key="OB-T03:aux", note="辅助负荷表间歇失联,输入覆盖 90%")
+
+    # SUB-S1:共享变电所表,同 shared_key 使 import/export 相关传播
+    for q in ("import", "export"):
+        mi(db, dev["SUB-S1"], q, cert_accuracy=0.006, cert_ref="CERT-SUB-S1",
+           calibrated_at=datetime(2026, 2, 1), calib_valid_to=val,
+           resolution=0.05, clock_tolerance_s=30.0, coverage_ratio=1.0,
+           shared_key="SUB-S1:meter")
+    # SUB-S2:校准已过期(证书可用,误差放大)
+    for q in ("import", "export"):
+        mi(db, dev["SUB-S2"], q, cert_accuracy=0.008, cert_ref="CERT-SUB-S2-OLD",
+           calibrated_at=datetime(2025, 6, 1), calib_valid_to=expired,
+           resolution=0.05, clock_tolerance_s=60.0, coverage_ratio=1.0,
+           shared_key="SUB-S2:meter")
+    # SUB-S3:缺校准证书(cert_accuracy=None -> 不可归因)
+    for q in ("import", "export"):
+        mi(db, dev["SUB-S3"], q, cert_accuracy=None, cert_ref=None,
+           calibrated_at=None, calib_valid_to=None, resolution=0.1,
+           clock_tolerance_s=45.0, coverage_ratio=1.0,
+           shared_key="SUB-S3:meter")
+
+
+def seed_uncertainty(db):
+    """为验收场景生成双侧(区间 + 联合抽样)不确定度归因结论与历史版本。
+
+    时间顺序:
+    1) 基准输入下评估全部验收范围;
+    2) 倍率证书晚到(OB-T01:traction v2)-> RUN-1001 只新增范围版本;
+    3) SUB-S2 到期校准补发新证书(v2)-> RUN-1004 差异范围收窄并新增版本。
+    旧评估版本一律保留,不回写主服务能量值。
+    """
+    # 班次级:同一班次含多列车,共享变电所表 -> 相关来源组
+    for shift in ("早高峰-1", "早高峰-2", "平峰-1", "平峰-2"):
+        for metric in ("KWH_PER_KM", "RECON_DIFF_KWH"):
+            for method in ("INTERVAL", "JOINT_SAMPLING"):
+                assess(db, "SHIFT", shift, metric, method, budget=5.0)
+    # 运行级:关键指标
+    for key, metric in [("RUN-1001", "NET_KWH"), ("RUN-1001", "RECON_DIFF_KWH"),
+                        ("RUN-1002", "NET_KWH"), ("RUN-1003", "RECON_DIFF_KWH"),
+                        ("RUN-1004", "RECON_DIFF_KWH"), ("RUN-1005", "NET_KWH"),
+                        ("RUN-1006", "RECON_DIFF_KWH")]:
+        for method in ("INTERVAL", "JOINT_SAMPLING"):
+            assess(db, "RUN", key, metric, method, budget=5.0)
+
+    # 历史版本样例 1:倍率证书晚到 -> 同一 input_key 新版本,不回写旧范围
+    dev = {d.serial: d for d in db.query(Device).all()}
+    v1 = (db.query(MeterInput)
+          .filter(MeterInput.input_key == "OB-T01:traction").first())
+    mi(db, dev["OB-T01"], "traction", input_key="OB-T01:traction", version=2,
+       supersedes=v1.id, cert_accuracy=0.0015, cert_ref="CERT-OB-T01-Z1",
+       calibrated_at=datetime(2026, 11, 1), calib_valid_to=datetime(2027, 11, 1),
+       resolution=0.1, clock_tolerance_s=0.0, coverage_ratio=1.0,
+       shared_key="OB-T01:traction",
+       note="倍率证书晚到:补充 Z1 区间证书(晚到,新版本)")
+    for method in ("INTERVAL", "JOINT_SAMPLING"):
+        assess(db, "RUN", "RUN-1001", "NET_KWH", method, budget=5.0,
+               note="倍率证书晚到后重算(新范围版本)")
+
+    # 历史版本样例 2:SUB-S2 采样时钟同步证书晚到 -> RUN-1004 范围只升版本
+    # (校准仍过期,读数不为零;仅时钟容差由 60s 收紧到 5s)
+    old = (db.query(MeterInput)
+           .filter(MeterInput.input_key == "SUB-S2:import").first())
+    mi(db, dev["SUB-S2"], "import", input_key="SUB-S2:import", version=2,
+       supersedes=old.id if old else None, cert_accuracy=0.008,
+       cert_ref="CERT-SUB-S2-CLK", calibrated_at=datetime(2025, 6, 1),
+       calib_valid_to=datetime(2026, 6, 30), resolution=0.05,
+       clock_tolerance_s=5.0,
+       coverage_ratio=1.0, shared_key="SUB-S2:meter",
+       note="采样时钟同步证书晚到(容差 60s->5s,新版本)")
+    assess(db, "RUN", "RUN-1004", "RECON_DIFF_KWH", "INTERVAL", budget=5.0,
+           note="时钟容差修正后重算(新范围版本,范围收窄)")
 
 
 def seed():
@@ -288,8 +418,12 @@ def seed():
         # SUB-S3 在该窗口无任何读数(表计检修)-> 供电侧未知
         process(db, r6)
 
+        # ============ 计量不确定度归因输入与结论 ============
+        seed_meter_inputs(db)
+        seed_uncertainty(db)
+
         db.commit()
-        print("seed ok: 6 runs, 含五类验收场景")
+        print("seed ok: 6 runs, 含五类验收场景 + 计量不确定度归因")
     finally:
         db.close()
 

@@ -11,6 +11,7 @@ const routes = [
       { path: 'runs', component: () => import('./views/Runs.vue') },
       { path: 'runs/:id', component: () => import('./views/RunDetail.vue') },
       { path: 'metrics', component: () => import('./views/Metrics.vue') },
+      { path: 'uncertainty', component: () => import('./views/Uncertainty.vue') },
       { path: 'replay', component: () => import('./views/Replay.vue') },
     ],
   },

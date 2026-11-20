@@ -27,3 +27,14 @@ export const METRIC_LABEL = {
   KWH_PER_PASSENGER: '单位载客能耗(kWh/人)', REGEN_RATIO: '回馈比例',
 }
 export const SCOPE_LABEL = { RUN: '运行', SECTION: '区段', SHIFT: '班次', VEHICLE_MODEL: '车型' }
+export const UNCERTAINTY_METHOD_LABEL = { INTERVAL: '区间传播', JOINT_SAMPLING: '联合抽样' }
+export const INPUT_STATUS_TAG = {
+  VALID: 'success', EXPIRED: 'warning', MISSING_CERT: 'danger', MISSING_INPUT: 'danger',
+}
+export const INPUT_STATUS_LABEL = {
+  VALID: '证书有效', EXPIRED: '校准已过期(放大)', MISSING_CERT: '缺证书', MISSING_INPUT: '无输入记录',
+}
+export const ACTION_LABEL = {
+  RECALIBRATE: '重新校准', CLOCK_SYNC: '时钟同步', COVERAGE_FILL: '补测覆盖',
+  OBTAIN_CERT: '取得证书', IMPROVE_RESOLUTION: '换高分辨率表',
+}

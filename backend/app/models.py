@@ -243,6 +243,73 @@ class ConfigVersion(Base):
     note = Column(String(255), nullable=True)
 
 
+# ---------------- 计量不确定度归因 ----------------
+
+class MeterInput(Base):
+    """一台设备的一个计量输入的量值证据(倍率证书/校准/分辨率/时钟/覆盖)。
+
+    - 每个 input_key(如 OB-T01:traction)独立版本化:倍率证书晚到只新增一版,
+      旧版本保留,已发布的不确定度范围只升版本不回写。
+    - cert_accuracy=None 表示该输入缺少校准证书:贡献不可归因,不得虚构精确值。
+    - shared_key 标识共享的物理计量关系(同一台表支撑多列车/多个量),
+      传播时按同一随机因子或同一最坏方向处理,而非各自独立。
+    """
+    __tablename__ = "meter_inputs"
+    id = Column(Integer, primary_key=True)
+    input_key = Column(String(96), nullable=False, index=True)  # 稳定业务键
+    version = Column(Integer, nullable=False, default=1)
+    supersedes_id = Column(Integer, ForeignKey("meter_inputs.id"), nullable=True)
+    device_id = Column(Integer, ForeignKey("devices.id"), nullable=False)
+    quantity = Column(String(16), nullable=False)   # traction|regen|aux|import|export
+    multiplier_cert = Column(Float, nullable=True)  # 证书标称倍率(仅作证据,不改写主服务)
+    cert_accuracy = Column(Float, nullable=True)    # 相对扩展不确定度(如 0.008 = ±0.8%)
+    cert_ref = Column(String(64), nullable=True)    # 证书编号
+    calibrated_at = Column(DateTime, nullable=True)
+    calib_valid_to = Column(DateTime, nullable=True)  # 校准有效期(过期不等于读数为零)
+    resolution = Column(Float, nullable=False, default=0.1)  # 分辨率(kWh/表码)
+    clock_tolerance_s = Column(Float, nullable=False, default=0.0)  # 采样时钟容差(秒)
+    coverage_ratio = Column(Float, nullable=False, default=1.0)     # 输入侧有效覆盖比例
+    shared_key = Column(String(96), nullable=False, index=True)     # 相关来源分组键
+    note = Column(String(255), nullable=True)
+    valid_from = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    device = relationship("Device")
+    __table_args__ = (UniqueConstraint("input_key", "version",
+                                       name="uq_meter_input_key_version"),)
+
+
+class UncertaintyAssessment(Base):
+    """某范围/指标/方法的一份不确定度归因结论。
+
+    只读主服务能量事实,不改变能量值与测量边界;倍率证书修订只新增版本。
+    range_band 为目标指标(非能量值)的扩展范围;decomposition 把范围宽度拆成
+    可归因贡献 + 相关来源合并贡献 + 不可独立拆分的残余。
+    """
+    __tablename__ = "uncertainty_assessments"
+    id = Column(Integer, primary_key=True)
+    scope = Column(String(16), nullable=False)        # RUN|SHIFT
+    scope_key = Column(String(64), nullable=False, index=True)
+    target_metric = Column(String(24), nullable=False)  # KWH_PER_KM|NET_KWH|SUPPLY_NET_KWH|REGEN_RATIO
+    method = Column(String(16), nullable=False)       # INTERVAL|JOINT_SAMPLING
+    version = Column(Integer, nullable=False, default=1)
+    supersedes_id = Column(Integer, ForeignKey("uncertainty_assessments.id"),
+                           nullable=True)
+    run_version = Column(Integer, nullable=False, default=1)
+    attributable = Column(String(8), nullable=False, default="TRUE")  # TRUE|FALSE
+    base_band = Column(JSON, nullable=False)          # 主服务指标范围(未加计量不确定度)
+    range_band = Column(JSON, nullable=False)         # 传播后的指标范围
+    decomposition = Column(JSON, nullable=False)      # attributable/correlated/residual
+    contributions = Column(JSON, nullable=False)      # 逐输入逐来源
+    correlated_groups = Column(JSON, nullable=False)  # 共享计量关系分组
+    unattributable = Column(JSON, nullable=False)     # 缺失关键输入等原因
+    candidates = Column(JSON, nullable=False)         # 预算内校准优先级
+    budget = Column(Float, nullable=False, default=5.0)
+    inputs_snapshot = Column(JSON, nullable=False)    # 使用的输入版本快照
+    source_run_ids = Column(JSON, nullable=False)
+    note = Column(String(255), nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
 def create_all():
     from . import models as _  # noqa
     Base.metadata.create_all(engine)

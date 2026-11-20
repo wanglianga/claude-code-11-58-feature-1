@@ -8,6 +8,7 @@
         <el-menu-item index="/readings">采集数据</el-menu-item>
         <el-menu-item index="/runs">运行与能量</el-menu-item>
         <el-menu-item index="/metrics">指标服务</el-menu-item>
+        <el-menu-item index="/uncertainty">不确定度归因</el-menu-item>
         <el-menu-item index="/replay">复盘回查</el-menu-item>
       </el-menu>
     </el-aside>

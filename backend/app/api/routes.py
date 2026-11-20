@@ -8,14 +8,18 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from ..config import LATE_ARRIVAL_SECONDS
+from ..config import LATE_ARRIVAL_SECONDS, UNCERTAINTY_DEFAULT_BUDGET
 from ..db import get_db
 from ..models import (ConfigVersion, Consist, Device, EnergyFragment, GridCell,
-                      Line, MeterReading, Metric, Reconciliation, Run, RunEvent,
-                      RunSegment, Section, Train, User)
+                      Line, MeterInput, MeterReading, Metric, Reconciliation,
+                      Run, RunEvent, RunSegment, Section, Train, User,
+                      UncertaintyAssessment)
 from ..services.evaluate import evaluate_run, rebuild_grid
 from ..services.metrics import publish_run_metrics, reprocess_run
 from ..services.reconcile import reconcile_grid_aligned, reconcile_run_aligned
+from ..services.uncertainty import (FIELD_SETS, METRIC_LABEL, SCOPE_LABEL,
+                                    assess, compute, compute_full,
+                                    method_guidance)
 
 router = APIRouter(prefix="/api")
 
@@ -66,6 +70,10 @@ def overview(db: Session = Depends(get_db), _: User = Depends(current_user)):
         "fragments": db.query(EnergyFragment).count(),
         "reconciliations": len(recs),
         "metrics": db.query(Metric).count(),
+        "meter_inputs": db.query(MeterInput).count(),
+        "uncertainty_assessments": db.query(UncertaintyAssessment).count(),
+        "uncertainty_unattributable": db.query(UncertaintyAssessment)
+        .filter(UncertaintyAssessment.attributable == "FALSE").count(),
         "comparable_full": sum(1 for r in recs if r.comparable == "FULL"),
         "comparable_partial": sum(1 for r in recs if r.comparable == "PARTIAL"),
     }
@@ -343,3 +351,201 @@ def list_config_versions(db: Session = Depends(get_db), _: User = Depends(curren
              "valid_to": c.valid_to.isoformat() if c.valid_to else None,
              "note": c.note}
             for c in db.query(ConfigVersion).order_by(ConfigVersion.valid_from).all()]
+
+
+# ---------------- 计量不确定度归因 ----------------
+
+def _mi_json(m: MeterInput) -> dict:
+    return {
+        "id": m.id, "input_key": m.input_key, "version": m.version,
+        "supersedes_id": m.supersedes_id, "device_id": m.device_id,
+        "device": m.device.serial if m.device else None,
+        "quantity": m.quantity, "multiplier_cert": m.multiplier_cert,
+        "cert_accuracy": m.cert_accuracy, "cert_ref": m.cert_ref,
+        "calibrated_at": m.calibrated_at.isoformat() if m.calibrated_at else None,
+        "calib_valid_to": m.calib_valid_to.isoformat() if m.calib_valid_to else None,
+        "expired": bool(m.calib_valid_to and m.calib_valid_to < datetime.utcnow()),
+        "resolution": m.resolution, "clock_tolerance_s": m.clock_tolerance_s,
+        "coverage_ratio": m.coverage_ratio, "shared_key": m.shared_key,
+        "valid_from": m.valid_from.isoformat(),
+        "created_at": m.created_at.isoformat(), "note": m.note,
+    }
+
+
+@router.get("/meter-inputs")
+def list_meter_inputs(latest_only: bool = True,
+                      db: Session = Depends(get_db),
+                      _: User = Depends(current_user)):
+    rows = db.query(MeterInput).order_by(MeterInput.input_key,
+                                         MeterInput.version).all()
+    if latest_only:
+        latest = {}
+        for m in rows:
+            latest[m.input_key] = m
+        rows = list(latest.values())
+    return [_mi_json(m) for m in rows]
+
+
+class MeterInputIn(BaseModel):
+    device_serial: str
+    quantity: str
+    multiplier_cert: Optional[float] = None
+    cert_accuracy: Optional[float] = None
+    cert_ref: Optional[str] = None
+    calibrated_at: Optional[datetime] = None
+    calib_valid_to: Optional[datetime] = None
+    resolution: float = 0.1
+    clock_tolerance_s: float = 0.0
+    coverage_ratio: float = 1.0
+    shared_key: Optional[str] = None
+    note: Optional[str] = None
+
+
+@router.post("/meter-inputs")
+def create_meter_input(body: MeterInputIn, db: Session = Depends(get_db),
+                       _: User = Depends(current_user)):
+    """登记一版计量输入。同一 input_key 自动递增为最新版本(旧版保留)。
+
+    倍率证书晚到只形成新的范围版本:本接口不回写任何已发布能量或范围。
+    """
+    device = db.query(Device).filter(Device.serial == body.device_serial).first()
+    if not device:
+        raise HTTPException(400, f"未知设备序列号 {body.device_serial}")
+    key = f"{body.device_serial}:{body.quantity}"
+    prev = (db.query(MeterInput).filter(MeterInput.input_key == key)
+            .order_by(MeterInput.version.desc()).first())
+    rec = MeterInput(
+        input_key=key, version=(prev.version + 1) if prev else 1,
+        supersedes_id=prev.id if prev else None, device_id=device.id,
+        quantity=body.quantity, multiplier_cert=body.multiplier_cert,
+        cert_accuracy=body.cert_accuracy, cert_ref=body.cert_ref,
+        calibrated_at=body.calibrated_at, calib_valid_to=body.calib_valid_to,
+        resolution=body.resolution, clock_tolerance_s=body.clock_tolerance_s,
+        coverage_ratio=body.coverage_ratio,
+        shared_key=body.shared_key or key, note=body.note)
+    db.add(rec)
+    db.commit()
+    db.refresh(rec)
+    return _mi_json(rec)
+
+
+def _assessment_json(a: UncertaintyAssessment) -> dict:
+    return {
+        "id": a.id, "scope": a.scope, "scope_key": a.scope_key,
+        "target_metric": a.target_metric, "metric_label": METRIC_LABEL.get(a.target_metric),
+        "method": a.method, "version": a.version,
+        "supersedes_id": a.supersedes_id, "run_version": a.run_version,
+        "attributable": a.attributable, "base_band": a.base_band,
+        "range_band": a.range_band, "decomposition": a.decomposition,
+        "contributions": a.contributions,
+        "correlated_groups": a.correlated_groups,
+        "unattributable": a.unattributable, "candidates": a.candidates,
+        "budget": a.budget, "inputs": a.inputs_snapshot,
+        "source_run_ids": a.source_run_ids, "note": a.note,
+        "created_at": a.created_at.isoformat(),
+    }
+
+
+@router.get("/uncertainty/meta")
+def uncertainty_meta(_: User = Depends(current_user)):
+    return {
+        "target_metrics": [{"key": k, "label": v} for k, v in METRIC_LABEL.items()],
+        "fields": {k: sorted(v) for k, v in FIELD_SETS.items()},
+        "scopes": [{"key": k, "label": v} for k, v in SCOPE_LABEL.items()],
+        "methods": [{"key": "INTERVAL", "label": "区间传播"},
+                    {"key": "JOINT_SAMPLING", "label": "联合抽样"}],
+        "source_labels": {"cert": "倍率/校准证书", "clock": "采样时钟容差",
+                          "coverage": "输入覆盖比例", "resolution": "分辨率"},
+        "default_budget": UNCERTAINTY_DEFAULT_BUDGET,
+    }
+
+
+@router.get("/uncertainty/latest")
+def uncertainty_latest(scope: Optional[str] = None,
+                       scope_key: Optional[str] = None,
+                       db: Session = Depends(get_db),
+                       _: User = Depends(current_user)):
+    """最新评估一览(按 范围/指标/方法 取最高版本)。"""
+    q = db.query(UncertaintyAssessment)
+    if scope:
+        q = q.filter(UncertaintyAssessment.scope == scope)
+    if scope_key:
+        q = q.filter(UncertaintyAssessment.scope_key == scope_key)
+    latest: dict = {}
+    for a in q.order_by(UncertaintyAssessment.version).all():
+        k = (a.scope, a.scope_key, a.target_metric, a.method)
+        latest[k] = a
+    return [_assessment_json(a) for a in
+            sorted(latest.values(), key=lambda x: (x.scope, x.scope_key,
+                                                   x.target_metric, x.method))]
+
+
+@router.get("/uncertainty/assessments")
+def uncertainty_assessments(scope: Optional[str] = None,
+                            scope_key: Optional[str] = None,
+                            target_metric: Optional[str] = None,
+                            method: Optional[str] = None,
+                            db: Session = Depends(get_db),
+                            _: User = Depends(current_user)):
+    """历史评估(全部版本,供复盘追溯)。"""
+    q = db.query(UncertaintyAssessment).order_by(
+        UncertaintyAssessment.id.desc())
+    if scope:
+        q = q.filter(UncertaintyAssessment.scope == scope)
+    if scope_key:
+        q = q.filter(UncertaintyAssessment.scope_key == scope_key)
+    if target_metric:
+        q = q.filter(UncertaintyAssessment.target_metric == target_metric)
+    if method:
+        q = q.filter(UncertaintyAssessment.method == method)
+    return [_assessment_json(a) for a in q.limit(400).all()]
+
+
+@router.post("/uncertainty/recompute")
+def uncertainty_recompute(scope: str, scope_key: str,
+                          target_metric: str = "NET_KWH",
+                          method: str = "INTERVAL",
+                          budget: float = UNCERTAINTY_DEFAULT_BUDGET,
+                          persist: bool = True,
+                          db: Session = Depends(get_db),
+                          _: User = Depends(current_user)):
+    """按当前输入重算归因与校准优先级;persist=true 时发布为新版本。
+
+    只读主服务能量事实,不修改任何能量值或测量边界。
+    """
+    if scope not in ("RUN", "SHIFT"):
+        raise HTTPException(400, "scope 必须为 RUN 或 SHIFT")
+    if target_metric not in FIELD_SETS:
+        raise HTTPException(400, f"未知指标 {target_metric}")
+    if method not in ("INTERVAL", "JOINT_SAMPLING"):
+        raise HTTPException(400, f"未知方法 {method}")
+    if not persist:
+        return compute_full(db, scope, scope_key, target_metric, method,
+                            budget=budget)
+    a = assess(db, scope, scope_key, target_metric, method, budget=budget,
+               note="按当前输入重算")
+    db.commit()
+    db.refresh(a)
+    return _assessment_json(a)
+
+
+@router.get("/uncertainty/guidance")
+def uncertainty_guidance(scope: str, scope_key: str,
+                         target_metric: str = "NET_KWH",
+                         db: Session = Depends(get_db),
+                         _: User = Depends(current_user)):
+    return method_guidance(db, scope, scope_key, target_metric)
+
+
+@router.get("/uncertainty/history")
+def uncertainty_history(scope: str, scope_key: str, target_metric: str,
+                        method: str = "INTERVAL",
+                        db: Session = Depends(get_db),
+                        _: User = Depends(current_user)):
+    rows = (db.query(UncertaintyAssessment)
+            .filter(UncertaintyAssessment.scope == scope,
+                    UncertaintyAssessment.scope_key == scope_key,
+                    UncertaintyAssessment.target_metric == target_metric,
+                    UncertaintyAssessment.method == method)
+            .order_by(UncertaintyAssessment.version).all())
+    return [_assessment_json(a) for a in rows]

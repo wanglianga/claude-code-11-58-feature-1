@@ -1,0 +1,8 @@
+# 安装源:https://mirrors.aliyun.com/pypi/simple/ (tsinghua 镜像对部分包返回 403)
+fastapi>=0.115
+uvicorn[standard]>=0.30
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
+pydantic>=2.10
+pytest>=8.0
+httpx>=0.28
